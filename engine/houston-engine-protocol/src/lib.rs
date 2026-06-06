@@ -16,6 +16,10 @@ pub use houston_terminal_manager::{
     AuthFailureCause, ModelUnavailableReason, ProviderError, QuotaScope,
 };
 
+/// CAPCOM — agent-to-agent negotiation protocol (handshake frames, proposals,
+/// and the human-in-the-loop approval gate).
+pub mod capcom;
+
 /// Protocol major version. Incremented on breaking changes.
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -53,6 +57,8 @@ pub enum EnvelopeKind {
     Ping,
     /// Keep-alive reply. Payload empty object.
     Pong,
+    /// Agent-to-agent negotiation frame (payload = `capcom::CapcomFrame`).
+    Handshake,
 }
 
 /// Client → server WebSocket request operations.
@@ -138,6 +144,7 @@ pub fn event_topic(event: &HoustonEvent) -> String {
         HoustonEvent::FeedItem { session_key, .. }
         | HoustonEvent::SessionStatus { session_key, .. } => format!("session:{session_key}"),
         HoustonEvent::AuthRequired { .. } => "auth".into(),
+        HoustonEvent::ApprovalRequest(_) => "capcom".into(),
         HoustonEvent::Toast { .. } | HoustonEvent::CompletionToast { .. } => "toast".into(),
         HoustonEvent::EventReceived { .. } | HoustonEvent::EventProcessed { .. } => {
             "events".into()

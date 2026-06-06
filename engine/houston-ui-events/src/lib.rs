@@ -103,6 +103,96 @@ impl ClaudeInstallError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CAPCOM — agent-to-agent negotiation vocabulary.
+//
+// Conceptually these are wire types and their natural home is
+// `houston-engine-protocol::capcom`. They live HERE for the same reason
+// `ClaudeInstallError` does: they are the payload of the
+// `HoustonEvent::ApprovalRequest` human-in-the-loop gate, and
+// `houston-engine-protocol` depends on this crate (never the reverse). Hosting
+// the payload in the protocol crate would form a dependency cycle, so we keep
+// the edge one-way and let `protocol::capcom` re-export every type below —
+// downstream code still imports them from `houston_engine_protocol::capcom::*`.
+// Keep both sides in lock-step with `houston-relay/src/capcom-types.ts`.
+// ---------------------------------------------------------------------------
+
+/// Public-facing identity an agent advertises in a HELLO/ACK. Non-secret by
+/// construction — it's what you're willing to tell a stranger's agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCard {
+    /// Stable id for this agent (workspace-scoped, opaque to peers).
+    pub id: String,
+    /// Human-readable name shown in the peer's approval gate.
+    pub name: String,
+    /// What this agent does, one line. Surfaced in the gate UI.
+    pub role: String,
+    /// Skill names this agent can offer/use (from houston-skills index).
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Composio toolkit slugs this agent touches (gmail, slack, ...).
+    #[serde(default)]
+    pub integrations: Vec<String>,
+}
+
+/// What a proposal is asking for. Intent-specific terms ride in
+/// [`CapcomProposal::terms`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalIntent {
+    LeadHandoff,
+    Meeting,
+    DataShare,
+    Other,
+}
+
+/// A negotiation offer. Structured with a free-text `message` field:
+/// validatable + showable in the approval gate, while still letting Claude
+/// reason in natural language.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CapcomProposal {
+    pub proposal_id: String,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub intent: ProposalIntent,
+    pub subject: String,
+    /// Intent-specific structured terms. Free-form JSON object so each
+    /// intent can carry its own shape (leadEmail, value, deadline, ...).
+    pub terms: serde_json::Value,
+    /// Natural-language note from the proposing agent. The receiving agent
+    /// may reason over this with Claude; the human sees it verbatim.
+    pub message: String,
+    #[serde(default = "default_true")]
+    pub requires_approval: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Which way a pending action crosses this user's boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDirection {
+    /// Something is leaving this user's side (A approves the outbound).
+    Outbound,
+    /// Something is entering this user's side (B approves the inbound).
+    Inbound,
+}
+
+/// Payload of the [`HoustonEvent::ApprovalRequest`] variant. Mirrors the
+/// existing `AuthRequired` pattern: pause, ask the human, resume on decision.
+/// The engine emits it; the desktop/dashboard renders Approve / Reject.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub proposal: CapcomProposal,
+    pub peer: AgentCard,
+    pub direction: ApprovalDirection,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum HoustonEvent {
@@ -129,6 +219,9 @@ pub enum HoustonEvent {
         provider: String,
         message: String,
     },
+    /// Human-in-the-loop gate for a CAPCOM negotiation. Pause, ask the
+    /// human, resume on decision. Same pattern as `AuthRequired`.
+    ApprovalRequest(ApprovalRequest),
     /// Activity completion notification.
     CompletionToast {
         title: String,
@@ -374,6 +467,36 @@ impl EventSink for FanoutEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_request_roundtrips_camel_case() {
+        let req = ApprovalRequest {
+            proposal: CapcomProposal {
+                proposal_id: "p1".into(),
+                from_agent: "a".into(),
+                to_agent: "b".into(),
+                intent: ProposalIntent::LeadHandoff,
+                subject: "Lead: Acme".into(),
+                terms: serde_json::json!({ "value": 5000 }),
+                message: "Warm lead, handing off.".into(),
+                requires_approval: true,
+            },
+            peer: AgentCard {
+                id: "a".into(),
+                name: "Outbound".into(),
+                role: "prospecting".into(),
+                skills: vec!["email-outreach".into()],
+                integrations: vec!["gmail".into()],
+            },
+            direction: ApprovalDirection::Inbound,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        // camelCase on the struct, snake_case on the direction enum.
+        assert!(s.contains("\"requiresApproval\":true"));
+        assert!(s.contains("\"direction\":\"inbound\""));
+        let back: ApprovalRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+    }
 
     #[test]
     fn noop_sink_drops_events() {
