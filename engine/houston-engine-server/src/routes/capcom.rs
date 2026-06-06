@@ -36,6 +36,22 @@ pub struct CapcomState {
     pub peers: Mutex<HashMap<String, PeerEndpoint>>,
     /// This engine's own card, advertised in HELLO/ACK.
     pub self_card: Mutex<Option<AgentCard>>,
+    /// If `Some`, route frames through the Cloudflare relay instead of
+    /// direct-to-peer (Camino A). Populated from env at boot; `None` keeps
+    /// the engine in direct mode (Camino B). `Mutex<Option<_>>` defaults to
+    /// `None`, so `#[derive(Default)]` still holds.
+    pub relay: Mutex<Option<RelayConfig>>,
+}
+
+/// Cloudflare relay coordinates. Present only when the engine is in relay
+/// mode (the `CAPCOM_RELAY_*` env vars are set — see `state::with_db`).
+#[derive(Clone)]
+pub struct RelayConfig {
+    pub url: String,
+    pub token: String,
+    pub room: String,
+    /// The agent id THIS engine sends as / polls its mailbox under.
+    pub self_id: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -146,26 +162,28 @@ async fn propose(
     Ok(Json(Ack { ok: true }))
 }
 
-/// peer → me. Receives a frame from another engine. A PROPOSAL raises the
-/// inbound gate; READY/REJECT resolve a pending negotiation.
-async fn inbound(
-    State(st): State<Arc<ServerState>>,
-    Json(req): Json<InboundRequest>,
-) -> Result<Json<Ack>, ApiError> {
-    match req.frame {
+/// peer → me. Acts on a received frame: a PROPOSAL/COUNTER raises the inbound
+/// gate; READY/REJECT resolve a pending negotiation; HELLO/ACK are discovery
+/// no-ops.
+///
+/// Extracted from the `inbound` route so the relay poller
+/// (`main::spawn_capcom_poller`) can drive the exact same logic for frames
+/// pulled from the mailbox — both transports converge here.
+pub async fn handle_inbound(st: &Arc<ServerState>, from_peer_id: &str, frame: CapcomFrame) {
+    match frame {
         CapcomFrame::Proposal { proposal } | CapcomFrame::Counter { proposal } => {
             let peer_card = {
                 let peers = st.capcom.peers.lock().unwrap();
                 peers
-                    .get(&req.from_peer_id)
+                    .get(from_peer_id)
                     .map(|p| p.card.clone())
-                    .unwrap_or_else(|| unknown_card(&req.from_peer_id))
+                    .unwrap_or_else(|| unknown_card(from_peer_id))
             };
             let pending = PendingProposal {
                 proposal: proposal.clone(),
                 peer: peer_card.clone(),
                 direction: ApprovalDirection::Inbound,
-                reply_to_peer_id: req.from_peer_id.clone(),
+                reply_to_peer_id: from_peer_id.to_string(),
             };
             st.capcom
                 .pending
@@ -197,6 +215,15 @@ async fn inbound(
             // Discovery frames — no gate. Could store the card here.
         }
     }
+}
+
+/// peer → me, over direct HTTP (Camino B). Thin route wrapper around
+/// [`handle_inbound`]; the relay poller calls the same fn for Camino A.
+async fn inbound(
+    State(st): State<Arc<ServerState>>,
+    Json(req): Json<InboundRequest>,
+) -> Result<Json<Ack>, ApiError> {
+    handle_inbound(&st, &req.from_peer_id, req.frame).await;
     Ok(Json(Ack { ok: true }))
 }
 
@@ -213,14 +240,6 @@ async fn approve(
         .unwrap()
         .remove(&decision.proposal_id)
         .ok_or_else(|| ApiError::not_found("no such pending proposal"))?;
-
-    let peer = {
-        let peers = st.capcom.peers.lock().unwrap();
-        peers
-            .get(&pending.reply_to_peer_id)
-            .cloned()
-            .ok_or_else(|| ApiError::bad_request("peer gone"))?
-    };
 
     let frame = if decision.approved {
         match pending.direction {
@@ -240,9 +259,27 @@ async fn approve(
         }
     };
 
-    forward_to_peer(&peer, &frame)
-        .await
-        .map_err(|e| ApiError::internal(format!("forward failed: {e}")))?;
+    // Relay mode (Camino A): address the peer by agent id and drop the frame in
+    // the relay mailbox — no PeerEndpoint URL/token needed, so we skip the peer
+    // lookup entirely (otherwise "peer gone" would fire spuriously). Direct mode
+    // (Camino B): resolve the peer and POST straight to it.
+    let relay_opt = st.capcom.relay.lock().unwrap().clone();
+    if let Some(relay) = relay_opt {
+        forward_via_relay(&relay, &pending.reply_to_peer_id, &frame)
+            .await
+            .map_err(|e| ApiError::internal(format!("relay forward failed: {e}")))?;
+    } else {
+        let peer = {
+            let peers = st.capcom.peers.lock().unwrap();
+            peers
+                .get(&pending.reply_to_peer_id)
+                .cloned()
+                .ok_or_else(|| ApiError::bad_request("peer gone"))?
+        };
+        forward_to_peer(&peer, &frame)
+            .await
+            .map_err(|e| ApiError::internal(format!("forward failed: {e}")))?;
+    }
 
     Ok(Json(Ack { ok: true }))
 }
@@ -277,6 +314,34 @@ async fn forward_to_peer(
             // NOT peer.peer_id — that's how WE address THEM. Sending the
             // recipient's id makes the receiver log an "unknown peer".
             from_peer_id: &peer.self_id,
+            frame,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// POST a frame to the Cloudflare relay's room mailbox, addressed to a peer
+/// agent id (Camino A). Used instead of [`forward_to_peer`] when relay mode is
+/// enabled. The relay holds the frame until the recipient's poller pulls it.
+async fn forward_via_relay(
+    relay: &RelayConfig,
+    to_agent: &str,
+    frame: &CapcomFrame,
+) -> Result<(), reqwest::Error> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        from: &'a str,
+        to: &'a str,
+        frame: &'a CapcomFrame,
+    }
+    reqwest::Client::new()
+        .post(format!("{}/room/{}/send", relay.url, relay.room))
+        .bearer_auth(&relay.token)
+        .json(&Body {
+            from: &relay.self_id,
+            to: to_agent,
             frame,
         })
         .send()

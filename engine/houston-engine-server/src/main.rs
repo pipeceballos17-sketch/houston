@@ -159,6 +159,11 @@ async fn main() {
     // pinned manifest in cli-deps.json.
     spawn_cli_lifecycles(state.clone());
 
+    // CAPCOM relay mailbox poller. Returns immediately (no task) unless relay
+    // mode is enabled via the CAPCOM_RELAY_* env vars — direct mode never polls.
+    // Must run before `build_router` moves `state`.
+    spawn_capcom_poller(state.clone());
+
     let app = build_router(state);
 
     // Block on PATH resolution just before serving. DB init usually
@@ -203,6 +208,57 @@ fn spawn_cli_lifecycles(state: Arc<ServerState>) {
             houston_claude_installer::ensure_and_upgrade(sink, db).await;
         });
     }
+}
+
+/// Poll the CAPCOM relay mailbox and feed pulled frames into the SAME
+/// `handle_inbound` logic the direct `/v1/capcom/inbound` route uses — both
+/// transports converge there.
+///
+/// No-op unless relay mode is enabled (the `CAPCOM_RELAY_*` env vars set the
+/// `relay` field at boot). In direct mode (Camino B) this returns immediately
+/// and the engine talks peer-to-peer as before.
+fn spawn_capcom_poller(state: Arc<ServerState>) {
+    let relay = match state.capcom.relay.lock().unwrap().clone() {
+        Some(r) => r,
+        None => return, // relay disabled → no poller (Camino B)
+    };
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}/room/{}/poll?agent={}",
+            relay.url, relay.room, relay.self_id
+        );
+        loop {
+            match client.get(&url).bearer_auth(&relay.token).send().await {
+                Ok(resp) => {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Some(items) = body.get("items").and_then(|v| v.as_array()) {
+                            for it in items {
+                                let from = it
+                                    .get("from")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                if let Some(fr) = it.get("frame") {
+                                    if let Ok(frame) = serde_json::from_value::<
+                                        houston_engine_protocol::capcom::CapcomFrame,
+                                    >(fr.clone())
+                                    {
+                                        houston_engine_server::routes::capcom::handle_inbound(
+                                            &state, &from, frame,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("[capcom poller] {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+    });
 }
 
 fn spawn_tunnel_if_allocated(state: Arc<ServerState>, engine_port: u16) {

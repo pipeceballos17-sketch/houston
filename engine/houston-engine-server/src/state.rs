@@ -95,6 +95,25 @@ impl ServerState {
         let mobile_access = MobileAccessStore::new(db);
         let tunnel_runtime = tunnel_identity.map(TunnelRuntimeState::new);
 
+        // CAPCOM negotiation state. Relay mode (Camino A) is opt-in: only when
+        // the `CAPCOM_RELAY_*` env vars are all present do we populate `relay`;
+        // otherwise the engine stays in direct mode (Camino B) and behaves
+        // exactly as before. `CAPCOM_ROOM` defaults to "capcom".
+        let capcom = Arc::new(crate::routes::capcom::CapcomState::default());
+        if let (Ok(url), Ok(token), Ok(self_id)) = (
+            std::env::var("CAPCOM_RELAY_URL"),
+            std::env::var("CAPCOM_RELAY_TOKEN"),
+            std::env::var("CAPCOM_SELF_ID"),
+        ) {
+            *capcom.relay.lock().unwrap() = Some(crate::routes::capcom::RelayConfig {
+                url,
+                token,
+                room: std::env::var("CAPCOM_ROOM").unwrap_or_else(|_| "capcom".into()),
+                self_id,
+            });
+            tracing::info!("[capcom] relay mode enabled");
+        }
+
         Self {
             config,
             events,
@@ -104,7 +123,7 @@ impl ServerState {
             tunnel_runtime,
             mobile_access,
             attachment_uploads: AttachmentUploadStore::default(),
-            capcom: Arc::new(crate::routes::capcom::CapcomState::default()),
+            capcom,
         }
     }
 }
