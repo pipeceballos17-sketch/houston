@@ -52,6 +52,8 @@ pub struct PendingProposal {
 #[serde(rename_all = "camelCase")]
 pub struct PeerEndpoint {
     pub peer_id: String,
+    /// El id con el que ESTE engine se anuncia ante este peer.
+    pub self_id: String,
     pub base_url: String,
     /// Bearer token for the peer engine. Demo-only; production rotates these.
     pub token: String,
@@ -271,9 +273,10 @@ async fn forward_to_peer(
         .post(format!("{}/v1/capcom/inbound", peer.base_url))
         .bearer_auth(&peer.token)
         .json(&Body {
-            // We identify ourselves to the peer by the id THEY know us as.
-            // For the demo this is symmetric; production resolves via card.
-            from_peer_id: &peer.peer_id,
+            // Announce ourselves by the id THIS peer knows us as (self_id),
+            // NOT peer.peer_id — that's how WE address THEM. Sending the
+            // recipient's id makes the receiver log an "unknown peer".
+            from_peer_id: &peer.self_id,
             frame,
         })
         .send()
