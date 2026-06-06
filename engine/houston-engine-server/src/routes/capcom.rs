@@ -17,6 +17,7 @@ use crate::state::ServerState;
 use axum::{extract::State, routing::post, Json, Router};
 use houston_engine_protocol::capcom::{
     AgentCard, ApprovalDecision, ApprovalDirection, ApprovalRequest, CapcomFrame, CapcomProposal,
+    ProposalIntent,
 };
 use houston_ui_events::{EventSink, HoustonEvent};
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,25 @@ pub struct Ack {
     pub ok: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeRequest {
+    pub instruction: String,
+    /// Who we're addressing (e.g. "agent-b"). Carried for the caller's
+    /// follow-up `propose` call; composition itself doesn't use it.
+    pub to_peer_id: String,
+    pub from_agent: String,
+    pub to_agent: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeResponse {
+    pub proposal: CapcomProposal,
+    /// "claude" | "fallback" — honest provenance for the demo UI.
+    pub source: String,
+}
+
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/capcom/peers", post(register_peer))
@@ -111,6 +131,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/capcom/inbound", post(inbound))
         .route("/capcom/approve", post(approve))
         .route("/capcom/pending", post(pending))
+        .route("/capcom/compose", post(compose))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -290,6 +311,142 @@ async fn pending(
 ) -> Result<Json<Vec<PendingProposal>>, ApiError> {
     let pending = st.capcom.pending.lock().unwrap();
     Ok(Json(pending.values().cloned().collect()))
+}
+
+// ── Compose: natural language → CapcomProposal ─────────────────────
+//
+// The engine's own `claude -p` (already installed + authenticated) does the
+// real reasoning; a keyword heuristic is the fallback so the demo never breaks
+// if Claude is missing or slow (>6s). Self-contained — does NOT touch the
+// terminal-manager session/streaming machinery.
+
+/// Turn a free-text instruction into a structured proposal. Always succeeds:
+/// Claude when available, heuristic otherwise. `source` reports which ran.
+async fn compose(
+    State(_st): State<Arc<ServerState>>,
+    Json(req): Json<ComposeRequest>,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    let pid = uuid::Uuid::new_v4().to_string();
+
+    // Try the engine's Claude first (real reasoning).
+    if let Some(proposal) = compose_with_claude(&req, &pid).await {
+        return Ok(Json(ComposeResponse {
+            proposal,
+            source: "claude".into(),
+        }));
+    }
+    // Fallback: never fail the demo. Log the degradation so it isn't silent.
+    tracing::warn!("[capcom] compose: Claude unavailable or slow — using heuristic fallback");
+    let proposal = compose_fallback(&req, &pid);
+    Ok(Json(ComposeResponse {
+        proposal,
+        source: "fallback".into(),
+    }))
+}
+
+/// Invoke `claude -p` (blocking, 6s hard timeout) and parse its JSON into a
+/// proposal. Returns `None` on any failure so the caller falls back.
+async fn compose_with_claude(req: &ComposeRequest, pid: &str) -> Option<CapcomProposal> {
+    if !houston_terminal_manager::claude_path::is_claude_available() {
+        return None;
+    }
+
+    let system = format!(
+        "You convert a user instruction into a CAPCOM proposal for agent-to-agent \
+         negotiation. Output ONLY minified JSON, no prose, matching exactly: \
+         {{\"intent\":\"lead_handoff|data_share|meeting|other\",\"subject\":\"short title\",\
+         \"terms\":{{...relevant key/values...}},\"message\":\"one sentence to the peer\"}}. \
+         from_agent={} to_agent={}.",
+        req.from_agent, req.to_agent
+    );
+
+    // Feed the resolved shell PATH so the engine-installed `claude` resolves
+    // even when the process PATH is minimal — same pattern as the other CLI
+    // spawns (claude_runner / provider_oneshot). `is_claude_available()` checks
+    // against this same PATH, so the spawn must use it too.
+    let out = tokio::process::Command::new("claude")
+        .env("PATH", houston_terminal_manager::claude_path::shell_path())
+        .arg("-p")
+        .arg("--output-format")
+        .arg("text")
+        .arg("--system-prompt")
+        .arg(&system)
+        .arg(&req.instruction)
+        .output();
+
+    // Hard timeout so a slow CLI never stalls the request (>6s → fallback).
+    let out = tokio::time::timeout(std::time::Duration::from_secs(6), out)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+
+    // Claude may wrap JSON in prose/fences — extract the first {...} block.
+    let json_str = extract_json_object(&raw)?;
+    #[derive(Deserialize)]
+    struct Parsed {
+        intent: String,
+        subject: String,
+        terms: serde_json::Value,
+        message: String,
+    }
+    let p: Parsed = serde_json::from_str(json_str).ok()?;
+
+    Some(CapcomProposal {
+        proposal_id: pid.to_string(),
+        from_agent: req.from_agent.clone(),
+        to_agent: req.to_agent.clone(),
+        intent: match p.intent.as_str() {
+            "lead_handoff" => ProposalIntent::LeadHandoff,
+            "meeting" => ProposalIntent::Meeting,
+            "data_share" => ProposalIntent::DataShare,
+            _ => ProposalIntent::Other,
+        },
+        subject: p.subject,
+        terms: p.terms,
+        message: p.message,
+        requires_approval: true,
+    })
+}
+
+/// Extract the first `{...}` slice from Claude's output (it may wrap the JSON
+/// in prose or code fences).
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    if end > start {
+        Some(&s[start..=end])
+    } else {
+        None
+    }
+}
+
+/// Heuristic fallback: keyword-sniff the intent and echo the instruction.
+/// Dumb but always works, so the demo never depends on Claude being up.
+fn compose_fallback(req: &ComposeRequest, pid: &str) -> CapcomProposal {
+    let lower = req.instruction.to_lowercase();
+    let intent = if lower.contains("skill") {
+        ProposalIntent::Other
+    } else if lower.contains("review") || lower.contains("contract") {
+        ProposalIntent::DataShare
+    } else if lower.contains("meet") || lower.contains("intro") {
+        ProposalIntent::Meeting
+    } else {
+        ProposalIntent::LeadHandoff
+    };
+    CapcomProposal {
+        proposal_id: pid.to_string(),
+        from_agent: req.from_agent.clone(),
+        to_agent: req.to_agent.clone(),
+        intent,
+        subject: req.instruction.chars().take(60).collect(),
+        terms: serde_json::json!({ "instruction": req.instruction }),
+        message: req.instruction.clone(),
+        requires_approval: true,
+    }
 }
 
 // ── Peer HTTP client ───────────────────────────────────────────────
