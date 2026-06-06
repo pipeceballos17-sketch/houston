@@ -32,6 +32,8 @@ pub struct ServerState {
     pub mobile_access: MobileAccessStore,
     /// Pending binary attachment uploads keyed by upload id.
     pub attachment_uploads: AttachmentUploadStore,
+    /// CAPCOM agent-to-agent negotiation state (pending proposals, peers).
+    pub capcom: Arc<crate::routes::capcom::CapcomState>,
 }
 
 impl ServerState {
@@ -102,6 +104,7 @@ impl ServerState {
             tunnel_runtime,
             mobile_access,
             attachment_uploads: AttachmentUploadStore::default(),
+            capcom: Arc::new(crate::routes::capcom::CapcomState::default()),
         }
     }
 }

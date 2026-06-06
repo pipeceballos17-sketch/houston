@@ -34,6 +34,9 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 futures-util = "0.3"
+# Used by the CAPCOM routes to POST frames to peer engines. rustls (not
+# native-tls) keeps the musl/Linux engine builds free of an OpenSSL dep.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 houston-engine-protocol = { version = "0.4.0", path = "../houston-engine-protocol" }
 houston-engine-core = { version = "0.4.0", path = "../houston-engine-core" }
 houston-composio = { workspace = true }

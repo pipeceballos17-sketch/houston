@@ -22,3 +22,6 @@ app/src-tauri/resources/bin/
 
 # Houston engine sidecar staged by build.rs (built from source in CI, not committed)
 app/src-tauri/binaries/
+
+# CAPCOM local e2e test script — contains live engine bearer tokens, never commit
+capcom-e2e-test.ps1

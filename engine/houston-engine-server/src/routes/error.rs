@@ -16,6 +16,23 @@ impl From<CoreError> for ApiError {
     }
 }
 
+impl ApiError {
+    /// 400 — the request was malformed or referenced something invalid.
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self(CoreError::BadRequest(msg.into()))
+    }
+
+    /// 404 — the addressed resource doesn't exist.
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self(CoreError::NotFound(msg.into()))
+    }
+
+    /// 500 — an unexpected server-side failure.
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self(CoreError::Internal(msg.into()))
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = self.0.code();

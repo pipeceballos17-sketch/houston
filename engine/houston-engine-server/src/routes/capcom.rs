@@ -1,55 +1,293 @@
-//! `/v1/capcom` — agent-to-agent negotiation (CAPCOM) with human gates.
+//! `/v1/capcom` — agent-to-agent negotiation (Camino B: direct HTTP).
 //!
-//! - `POST /v1/capcom/propose`   emit a Proposal to a peer via the relay
-//! - `POST /v1/capcom/approve`   record the human verdict (Ready / Reject)
-//! - `GET  /v1/capcom/peers`     list known peer agent cards
+//! Two engines (A = outbound, B = inbound) talk directly over their public
+//! Railway URLs. Every cross-user action raises a human-approval gate on the
+//! local engine before the frame is forwarded. The relay (Camino A) can be
+//! layered on later without changing these handlers — only the transport.
 //!
-//! Block 1 is the route skeleton: the surface compiles and is registered, and
-//! every handler parses its typed body. The relay transport that actually
-//! carries `CapcomFrame`s between peers lands in a later block — until then the
-//! mutating routes report `Unavailable` rather than silently succeeding.
+//! Routes:
+//!   POST /v1/capcom/peers          register/list known peer engines
+//!   POST /v1/capcom/propose        A → B: send a proposal (raises B's gate)
+//!   POST /v1/capcom/inbound        peer → me: receive a frame (internal)
+//!   POST /v1/capcom/approve        human verdict on a pending proposal
+//!   POST /v1/capcom/pending        list proposals awaiting my human's gate
 
 use crate::routes::error::ApiError;
 use crate::state::ServerState;
-use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
+use axum::{extract::State, routing::post, Json, Router};
+use houston_engine_protocol::capcom::{
+    AgentCard, ApprovalDecision, ApprovalDirection, ApprovalRequest, CapcomFrame, CapcomProposal,
 };
-use houston_engine_core::CoreError;
-use houston_engine_protocol::capcom::{AgentCard, ApprovalDecision, CapcomProposal};
-use std::sync::Arc;
+use houston_ui_events::{EventSink, HoustonEvent};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+// ── In-memory negotiation state ────────────────────────────────────
+//
+// For the hackathon demo this lives in a Mutex<HashMap>. Production would
+// persist to houston-db, but pending proposals are ephemeral by nature.
+
+#[derive(Default)]
+pub struct CapcomState {
+    /// proposalId → the proposal awaiting this engine's human gate.
+    pub pending: Mutex<HashMap<String, PendingProposal>>,
+    /// Known peers we can talk to (peerId → base URL + bearer token).
+    pub peers: Mutex<HashMap<String, PeerEndpoint>>,
+    /// This engine's own card, advertised in HELLO/ACK.
+    pub self_card: Mutex<Option<AgentCard>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProposal {
+    pub proposal: CapcomProposal,
+    pub peer: AgentCard,
+    pub direction: ApprovalDirection,
+    /// Where to forward the READY/REJECT once the human decides.
+    pub reply_to_peer_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerEndpoint {
+    pub peer_id: String,
+    pub base_url: String,
+    /// Bearer token for the peer engine. Demo-only; production rotates these.
+    pub token: String,
+    pub card: AgentCard,
+}
+
+// ── Request/response DTOs ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterPeerRequest {
+    pub peer: PeerEndpoint,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposeRequest {
+    pub to_peer_id: String,
+    pub proposal: CapcomProposal,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundRequest {
+    pub from_peer_id: String,
+    pub frame: CapcomFrame,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ack {
+    pub ok: bool,
+}
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/capcom/propose", post(propose)) // emit Proposal to peer via relay
-        .route("/capcom/approve", post(approve)) // human verdict → Ready/Reject
-        .route("/capcom/peers", get(peers)) // list known peer cards
+        .route("/capcom/peers", post(register_peer))
+        .route("/capcom/propose", post(propose))
+        .route("/capcom/inbound", post(inbound))
+        .route("/capcom/approve", post(approve))
+        .route("/capcom/pending", post(pending))
 }
 
-/// Emit a CAPCOM proposal to a peer over the relay.
+// ── Handlers ───────────────────────────────────────────────────────
+
+/// Register a peer engine we can negotiate with.
+async fn register_peer(
+    State(st): State<Arc<ServerState>>,
+    Json(req): Json<RegisterPeerRequest>,
+) -> Result<Json<Ack>, ApiError> {
+    let mut peers = st.capcom.peers.lock().unwrap();
+    peers.insert(req.peer.peer_id.clone(), req.peer);
+    Ok(Json(Ack { ok: true }))
+}
+
+/// A → B. Outbound side. Raises THIS engine's outbound gate first; only on
+/// approval does the proposal actually leave (see `approve`). Here we just
+/// stage it and emit the gate event.
 async fn propose(
-    State(_st): State<Arc<ServerState>>,
-    Json(_proposal): Json<CapcomProposal>,
-) -> Result<Json<()>, ApiError> {
-    Err(ApiError(CoreError::Unavailable(
-        "CAPCOM peer transport isn't wired yet — sending a proposal to a peer lands in a later block.".into(),
-    )))
+    State(st): State<Arc<ServerState>>,
+    Json(req): Json<ProposeRequest>,
+) -> Result<Json<Ack>, ApiError> {
+    let peer = {
+        let peers = st.capcom.peers.lock().unwrap();
+        peers
+            .get(&req.to_peer_id)
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("unknown peer"))?
+    };
+
+    // Stage as pending-outbound and raise the local human gate.
+    let pending = PendingProposal {
+        proposal: req.proposal.clone(),
+        peer: peer.card.clone(),
+        direction: ApprovalDirection::Outbound,
+        reply_to_peer_id: req.to_peer_id.clone(),
+    };
+    st.capcom
+        .pending
+        .lock()
+        .unwrap()
+        .insert(req.proposal.proposal_id.clone(), pending);
+
+    st.events.emit(HoustonEvent::ApprovalRequest(ApprovalRequest {
+        proposal: req.proposal,
+        peer: peer.card,
+        direction: ApprovalDirection::Outbound,
+    }));
+
+    Ok(Json(Ack { ok: true }))
 }
 
-/// Record the human's verdict on a pending proposal (Ready / Reject).
+/// peer → me. Receives a frame from another engine. A PROPOSAL raises the
+/// inbound gate; READY/REJECT resolve a pending negotiation.
+async fn inbound(
+    State(st): State<Arc<ServerState>>,
+    Json(req): Json<InboundRequest>,
+) -> Result<Json<Ack>, ApiError> {
+    match req.frame {
+        CapcomFrame::Proposal { proposal } | CapcomFrame::Counter { proposal } => {
+            let peer_card = {
+                let peers = st.capcom.peers.lock().unwrap();
+                peers
+                    .get(&req.from_peer_id)
+                    .map(|p| p.card.clone())
+                    .unwrap_or_else(|| unknown_card(&req.from_peer_id))
+            };
+            let pending = PendingProposal {
+                proposal: proposal.clone(),
+                peer: peer_card.clone(),
+                direction: ApprovalDirection::Inbound,
+                reply_to_peer_id: req.from_peer_id.clone(),
+            };
+            st.capcom
+                .pending
+                .lock()
+                .unwrap()
+                .insert(proposal.proposal_id.clone(), pending);
+
+            st.events.emit(HoustonEvent::ApprovalRequest(ApprovalRequest {
+                proposal,
+                peer: peer_card,
+                direction: ApprovalDirection::Inbound,
+            }));
+        }
+        CapcomFrame::Ready { proposal_id } => {
+            st.capcom.pending.lock().unwrap().remove(&proposal_id);
+            st.events.emit(HoustonEvent::Toast {
+                message: format!("Deal {proposal_id} accepted by peer"),
+                variant: "success".into(),
+            });
+        }
+        CapcomFrame::Reject { proposal_id, reason } => {
+            st.capcom.pending.lock().unwrap().remove(&proposal_id);
+            st.events.emit(HoustonEvent::Toast {
+                message: format!("Deal {proposal_id} rejected: {reason}"),
+                variant: "error".into(),
+            });
+        }
+        CapcomFrame::Hello { .. } | CapcomFrame::Ack { .. } => {
+            // Discovery frames — no gate. Could store the card here.
+        }
+    }
+    Ok(Json(Ack { ok: true }))
+}
+
+/// The human's verdict on a pending proposal. On approval we forward the
+/// frame to the peer; on rejection we send a REJECT.
 async fn approve(
-    State(_st): State<Arc<ServerState>>,
-    Json(_decision): Json<ApprovalDecision>,
-) -> Result<Json<()>, ApiError> {
-    Err(ApiError(CoreError::Unavailable(
-        "CAPCOM peer transport isn't wired yet — relaying a verdict to the peer lands in a later block.".into(),
-    )))
+    State(st): State<Arc<ServerState>>,
+    Json(decision): Json<ApprovalDecision>,
+) -> Result<Json<Ack>, ApiError> {
+    let pending = st
+        .capcom
+        .pending
+        .lock()
+        .unwrap()
+        .remove(&decision.proposal_id)
+        .ok_or_else(|| ApiError::not_found("no such pending proposal"))?;
+
+    let peer = {
+        let peers = st.capcom.peers.lock().unwrap();
+        peers
+            .get(&pending.reply_to_peer_id)
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("peer gone"))?
+    };
+
+    let frame = if decision.approved {
+        match pending.direction {
+            // Outbound approved: the proposal now actually leaves for the peer.
+            ApprovalDirection::Outbound => CapcomFrame::Proposal {
+                proposal: pending.proposal.clone(),
+            },
+            // Inbound approved: tell the peer the deal is done.
+            ApprovalDirection::Inbound => CapcomFrame::Ready {
+                proposal_id: decision.proposal_id.clone(),
+            },
+        }
+    } else {
+        CapcomFrame::Reject {
+            proposal_id: decision.proposal_id.clone(),
+            reason: decision.reason.unwrap_or_else(|| "declined by human".into()),
+        }
+    };
+
+    forward_to_peer(&peer, &frame)
+        .await
+        .map_err(|e| ApiError::internal(format!("forward failed: {e}")))?;
+
+    Ok(Json(Ack { ok: true }))
 }
 
-/// List the peer agent cards this engine currently knows about.
-async fn peers(State(_st): State<Arc<ServerState>>) -> Json<Vec<AgentCard>> {
-    // No peer registry yet; the relay-backed roster lands in a later block.
-    // An empty list is the truthful current state, not a swallowed error.
-    Json(Vec::new())
+/// List proposals awaiting this engine's human gate (drives the dashboard).
+async fn pending(
+    State(st): State<Arc<ServerState>>,
+) -> Result<Json<Vec<PendingProposal>>, ApiError> {
+    let pending = st.capcom.pending.lock().unwrap();
+    Ok(Json(pending.values().cloned().collect()))
+}
+
+// ── Peer HTTP client ───────────────────────────────────────────────
+
+/// POST a frame to a peer engine's `/v1/capcom/inbound`.
+async fn forward_to_peer(
+    peer: &PeerEndpoint,
+    frame: &CapcomFrame,
+) -> Result<(), reqwest::Error> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body<'a> {
+        from_peer_id: &'a str,
+        frame: &'a CapcomFrame,
+    }
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{}/v1/capcom/inbound", peer.base_url))
+        .bearer_auth(&peer.token)
+        .json(&Body {
+            // We identify ourselves to the peer by the id THEY know us as.
+            // For the demo this is symmetric; production resolves via card.
+            from_peer_id: &peer.peer_id,
+            frame,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn unknown_card(id: &str) -> AgentCard {
+    AgentCard {
+        id: id.to_string(),
+        name: format!("Unknown peer ({id})"),
+        role: "unknown".into(),
+        skills: vec![],
+        integrations: vec![],
+    }
 }
